@@ -39,7 +39,6 @@ TICKER_GROUPS = [
 
 SLOT_SIZE          = 1000.0   # $ per slot
 MAX_RISK_PER_SLOT  = 20.0     # 2% of $1,000 — risk per slot per trade
-MAX_LOSS_PER_SLOT  = 50.0     # halt group if loss > slots × $50
 TARGET_PER_SLOT    = 10.0     # keep trading until group hits slots × $10 profit
 ATR_STOP_MULT      = 1.5      # stop_loss  = entry ± ATR × 1.5
 ATR_TP_MULT        = 2.5      # take_profit = entry ± ATR × 2.5
@@ -270,13 +269,28 @@ def close_all_positions(trading):
     log.info("3:45 PM — closing all open positions.")
     try:
         for p in trading.get_all_positions():
-            if not any(c.isdigit() for c in p.symbol):  # skip options
+            close_position(trading, p.symbol, {
+                "qty":           float(p.qty),
+                "unrealized_pl": float(p.unrealized_pl),
+            })
+    except Exception as e:
+        log.error("Error closing positions: %s", e)
+
+
+def cleanup_foreign_positions(trading):
+    """Close any positions that are not part of the EMA strategy."""
+    ema_tickers = {g["ticker"] for g in TICKER_GROUPS}
+    try:
+        for p in trading.get_all_positions():
+            if p.symbol not in ema_tickers:
+                log.info("CLEANUP: closing non-EMA position %s (P&L=$%.2f)",
+                         p.symbol, float(p.unrealized_pl))
                 close_position(trading, p.symbol, {
                     "qty":           float(p.qty),
                     "unrealized_pl": float(p.unrealized_pl),
                 })
     except Exception as e:
-        log.error("Error closing positions: %s", e)
+        log.error("Cleanup error: %s", e)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -290,6 +304,9 @@ def run():
         close_all_positions(trading)
         save_state(state)
         return
+
+    # Always close any positions not in the EMA strategy (cleanup foreign trades)
+    cleanup_foreign_positions(trading)
 
     # Update total daily P&L
     try:
