@@ -1,11 +1,16 @@
-name: SMA Crossover Bot ($1k Account)
+name: EMA Crossover Bot ($100K / 6 Groups)
 
 on:
   schedule:
-    # Every 5 min during trade window 9:25-11:35 AM ET (13:25-15:35 UTC)
-    - cron: '25-59/5 13 * * 1-5'
-    - cron: '*/5 14,15 * * 1-5'
-    # Close all at 3:45 PM ET (19:45 UTC)
+    # Window 1: 9:40–11:35 AM ET (13:40–15:35 UTC)
+    - cron: '40-59/5 13 * * 1-5'
+    - cron: '*/5 14 * * 1-5'
+    - cron: '0,5,10,15,20,25,30,35 15 * * 1-5'
+    # Window 2: 1:25–3:05 PM ET (17:25–19:05 UTC)
+    - cron: '25,30,35,40,45,50,55 17 * * 1-5'
+    - cron: '*/5 18 * * 1-5'
+    - cron: '0,5 19 * * 1-5'
+    # Close all: 3:45 PM ET (19:45 UTC)
     - cron: '45 19 * * 1-5'
   workflow_dispatch:
 
@@ -14,28 +19,23 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
       - name: Install dependencies
         run: pip install alpaca-py pandas numpy requests
-
-      - name: Run SMA bot
+      - name: Run EMA bot
         env:
           ALPACA_API_KEY_TECH:    ${{ secrets.ALPACA_API_KEY_TECH }}
           ALPACA_SECRET_KEY_TECH: ${{ secrets.ALPACA_SECRET_KEY_TECH }}
           ALPACA_PAPER:           "true"
         run: python sma_bot.py
-
       - name: Commit state
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add state.json || true
-          git diff --cached --quiet || git commit -m "chore: update sma bot state [skip ci]"
+          git diff --cached --quiet || git commit -m "chore: update ema bot state [skip ci]"
           git push
