@@ -1,15 +1,12 @@
 """
-SMA Crossover Day Trading Bot
-Account: $100K treated as 100 × $1,000 slots
-Goal: $10/slot/day = $1,000/day total
-Strategy: Scans 50+ stocks every 5 min, finds SMA(9)/SMA(21) crossover + VWAP
-Each slot: $1,000 position | $20 risk | $50 daily loss limit
-Total limits: $2,000 risk per cycle | $5,000 max daily loss | 100 positions max
-Hours: 9:30–11:30 AM ET only | Close all by 3:45 PM ET
+EMA Crossover Day Trading Bot
+Account: $100K in 6 ticker groups (100 virtual $1,000 slots)
+Strategy: 9/21 EMA crossover + VWAP + RSI(14) + ATR(14) stops + volume filter
+Windows: 9:45–11:30 AM ET | 1:30–3:00 PM ET | Close all 3:45 PM ET
 """
 
 import os, json, logging, xml.etree.ElementTree as ETree
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -21,7 +18,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -29,62 +26,53 @@ log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-# Tickers exclusive to the SMA bot — no overlap with the tech trader
-# (Tech trader uses: AAPL, MSFT, NVDA, TSLA, AMZN, META, GOOGL, AMD,
-#  PLTR, ARM, CLS, SMCI, NFLX, ORCL, ADBE, CRM, JPM, BAC, GS, MS,
-#  XOM, CVX, OXY, COIN, MSTR, HOOD, DKNG, RBLX, SNAP, UBER, SHOP,
-#  QCOM, INTC, MU, AVGO, RIVN, NIO, SPY, QQQ)
-SCAN_UNIVERSE = [
-    # ETFs not used by tech trader
-    "IWM", "DIA", "GLD", "TLT", "XLF", "XLE", "XLK",
-    # Large cap not used by tech trader
-    "ORCL", "ADBE", "CRM", "PYPL", "SQ", "ABNB", "LYFT",
-    # Finance not used by tech trader
-    "WFC", "C", "AXP", "V", "MA",
-    # Healthcare
-    "JNJ", "PFE", "MRNA", "ABBV", "LLY",
-    # Consumer
-    "WMT", "COST", "TGT", "HD", "NKE",
-    # Industrials / other
-    "CAT", "BA", "GE", "F", "GM",
-    # Semi not used by tech trader
-    "TSM", "AMAT", "LRCX",
-    # Media / telecom
-    "DIS", "NFLX", "T", "VZ",
+# 6 ticker groups — each slot = $1,000 of capital
+# Groups are non-overlapping with tech_trader.py
+TICKER_GROUPS = [
+    {"ticker": "SPY",  "slots": 20},   # slots  1–20:  $20K
+    {"ticker": "QQQ",  "slots": 20},   # slots 21–40:  $20K
+    {"ticker": "AAPL", "slots": 15},   # slots 41–55:  $15K
+    {"ticker": "AMD",  "slots": 15},   # slots 56–70:  $15K
+    {"ticker": "NVDA", "slots": 15},   # slots 71–85:  $15K
+    {"ticker": "MSFT", "slots": 15},   # slots 86–100: $15K
 ]
-ET              = ZoneInfo("America/New_York")
-MARKET_OPEN     = (9, 30)
-TRADE_WINDOW_END = (11, 30)
-CLOSE_ALL_TIME  = (15, 45)
 
-# Per-slot rules (each slot = $1,000)
-SLOT_SIZE          = 1000.0  # dollars per position
-TOTAL_SLOTS        = 100     # 100 × $1,000 = $100K
-MAX_RISK_PER_TRADE = 20.0    # $20 stop loss per slot (2% of $1,000)
-MAX_DAILY_LOSS     = 5000.0  # $50 × 100 slots = $5,000 total daily loss limit
-MAX_POSITIONS      = 100     # up to 100 open at once (one per slot)
-STOP_LOSS_PCT      = 0.005   # 0.5% stop loss
-TAKE_PROFIT_PCT    = 0.010   # 1.0% take profit
+SLOT_SIZE          = 1000.0   # $ per slot
+MAX_RISK_PER_SLOT  = 20.0     # 2% of $1,000 — risk per slot per trade
+MAX_LOSS_PER_SLOT  = 50.0     # halt group if unrealized loss > slots × $50
+MAX_TRADES_PER_DAY = 2        # max round-trips per group per day
+ATR_STOP_MULT      = 1.5      # stop_loss  = entry ± ATR × 1.5
+ATR_TP_MULT        = 2.5      # take_profit = entry ± ATR × 2.5
+EMA_FAST_PERIOD    = 9
+EMA_SLOW_PERIOD    = 21
+RSI_PERIOD         = 14
+ATR_PERIOD         = 14
+VOLUME_LOOKBACK    = 20
+
+NY_TZ          = ZoneInfo("America/New_York")
+TRADE_WINDOW_1 = ((9, 45), (11, 30))   # morning session
+TRADE_WINDOW_2 = ((13, 30), (15, 0))   # afternoon session
+CLOSE_ALL_TIME = (15, 45)
 
 STATE_FILE = Path(__file__).parent / "state.json"
-
-NEGATIVE_KEYWORDS = [
-    "crash", "plunge", "tumble", "collapse", "fall", "drop", "decline",
-    "sell-off", "selloff", "warning", "risk", "recession", "loss",
-    "downgrade", "miss", "disappoints", "fears", "concern", "trouble",
-    "investigation", "lawsuit", "fraud", "halt", "suspend",
-]
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
 def load_state() -> dict:
-    today = datetime.now(ET).date().isoformat()
+    today = datetime.now(NY_TZ).date().isoformat()
     if STATE_FILE.exists():
         s = json.loads(STATE_FILE.read_text())
         if s.get("date") == today:
             return s
-    return {"date": today, "daily_pl": 0.0, "open_positions": 0}
+    return {
+        "date": today,
+        "total_daily_pl": 0.0,
+        "groups": {
+            g["ticker"]: {"trades_today": 0, "halted": False}
+            for g in TICKER_GROUPS
+        },
+    }
 
 
 def save_state(state: dict):
@@ -103,79 +91,99 @@ def get_clients():
 # ── Time helpers ──────────────────────────────────────────────────────────────
 
 def now_et() -> datetime:
-    return datetime.now(ET)
+    return datetime.now(NY_TZ)
 
 
 def in_trade_window() -> bool:
     t = now_et()
-    start = t.replace(hour=MARKET_OPEN[0],      minute=MARKET_OPEN[1],      second=0)
-    end   = t.replace(hour=TRADE_WINDOW_END[0], minute=TRADE_WINDOW_END[1], second=0)
-    return start <= t <= end
+
+    def window(start, end) -> bool:
+        s = t.replace(hour=start[0], minute=start[1], second=0, microsecond=0)
+        e = t.replace(hour=end[0],   minute=end[1],   second=0, microsecond=0)
+        return s <= t <= e
+
+    return window(*TRADE_WINDOW_1) or window(*TRADE_WINDOW_2)
 
 
 def is_close_all_time() -> bool:
     t = now_et()
-    close = t.replace(hour=CLOSE_ALL_TIME[0], minute=CLOSE_ALL_TIME[1], second=0)
+    close = t.replace(hour=CLOSE_ALL_TIME[0], minute=CLOSE_ALL_TIME[1],
+                      second=0, microsecond=0)
     return t >= close
-
-
-# ── News sentiment (MarketWatch RSS) ─────────────────────────────────────────
-
-def has_negative_news(ticker: str) -> bool:
-    """Returns True if recent MarketWatch news contains negative keywords for this ticker."""
-    try:
-        url = f"https://feeds.marketwatch.com/marketwatch/topstories/"
-        r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-        root = ETree.fromstring(r.content)
-        headlines = []
-        for item in root.iter("item"):
-            title = item.findtext("title") or ""
-            desc  = item.findtext("description") or ""
-            headlines.append((title + " " + desc).lower())
-
-        ticker_lower = ticker.lower()
-        relevant = [h for h in headlines if ticker_lower in h]
-
-        for headline in relevant:
-            for kw in NEGATIVE_KEYWORDS:
-                if kw in headline:
-                    log.info("NEWS FILTER blocked %s — negative headline: '%.80s'", ticker, headline)
-                    return True
-        return False
-    except Exception as e:
-        log.warning("Could not fetch news (%s), proceeding anyway", e)
-        return False
 
 
 # ── Indicators ────────────────────────────────────────────────────────────────
 
-def calculate_vwap(df: pd.DataFrame) -> pd.Series:
-    typical = (df["high"] + df["low"] + df["close"]) / 3
-    cumvol  = df["volume"].cumsum()
-    cumtpv  = (typical * df["volume"]).cumsum()
-    return cumtpv / cumvol
+def calc_ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
 
 
-def sma_crossover_signal(close: pd.Series) -> str:
+def calc_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series:
+    hi, lo, cl = df["high"], df["low"], df["close"]
+    tr = pd.concat([
+        hi - lo,
+        (hi - cl.shift()).abs(),
+        (lo - cl.shift()).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(span=period, adjust=False).mean()
+
+
+def calc_rsi(series: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
+    delta = series.diff()
+    gain  = delta.clip(lower=0).ewm(com=period - 1, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(com=period - 1, adjust=False).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def calc_vwap(df: pd.DataFrame) -> pd.Series:
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    return (tp * df["volume"]).cumsum() / df["volume"].cumsum()
+
+
+def get_signal(df: pd.DataFrame):
     """
-    Returns 'buy' if SMA9 just crossed above SMA21 on the last bar.
-    Returns 'sell' if SMA9 just crossed below SMA21.
-    Returns 'none' otherwise.
+    Returns (signal, price, cur_atr, stop_price, tp_price).
+    signal is 'buy', 'sell', or 'none'.
     """
-    if len(close) < 22:
-        return "none"
-    sma9  = close.rolling(9).mean()
-    sma21 = close.rolling(21).mean()
+    min_bars = max(EMA_SLOW_PERIOD, ATR_PERIOD, RSI_PERIOD, VOLUME_LOOKBACK) + 3
+    if len(df) < min_bars:
+        return "none", 0.0, 0.0, 0.0, 0.0
 
-    # Check last two bars for crossover
-    prev_above = sma9.iloc[-2] > sma21.iloc[-2]
-    curr_above = sma9.iloc[-1] > sma21.iloc[-1]
+    e9   = calc_ema(df["close"], EMA_FAST_PERIOD)
+    e21  = calc_ema(df["close"], EMA_SLOW_PERIOD)
+    cur_rsi  = calc_rsi(df["close"]).iloc[-1]
+    cur_atr  = calc_atr(df).iloc[-1]
+    cur_vwap = calc_vwap(df).iloc[-1]
+    price    = df["close"].iloc[-1]
+    cur_vol  = df["volume"].iloc[-1]
+    avg_vol  = df["volume"].rolling(VOLUME_LOOKBACK).mean().iloc[-2]  # avoid look-ahead
 
-    if not prev_above and curr_above:
-        return "buy"
-    if prev_above and not curr_above:
-        return "sell"
-    return "none"
+    if pd.isna(cur_atr) or cur_atr <= 0:
+        return "none", price, 0.0, 0.0, 0.0
+
+    prev_above = e9.iloc[-2] > e21.iloc[-2]
+    curr_above = e9.iloc[-1] > e21.iloc[-1]
+
+    # LONG: EMA crossed up, price above VWAP, RSI 45–65, volume surge
+    if (not prev_above and curr_above
+            and price > cur_vwap
+            and 45 <= cur_rsi <= 65
+            and cur_vol > avg_vol):
+        stop = round(price - cur_atr * ATR_STOP_MULT, 2)
+        tp   = round(price + cur_atr * ATR_TP_MULT,   2)
+        return "buy", price, cur_atr, stop, tp
+
+    # SHORT: EMA crossed down, price below VWAP, RSI 35–55, volume surge
+    if (prev_above and not curr_above
+            and price < cur_vwap
+            and 35 <= cur_rsi <= 55
+            and cur_vol > avg_vol):
+        stop = round(price + cur_atr * ATR_STOP_MULT, 2)
+        tp   = round(price - cur_atr * ATR_TP_MULT,   2)
+        return "sell", price, cur_atr, stop, tp
+
+    return "none", price, cur_atr, 0.0, 0.0
 
 
 # ── Execution ─────────────────────────────────────────────────────────────────
@@ -204,23 +212,27 @@ def close_position(trading, ticker: str, position: dict):
         log.error("Failed to close %s: %s", ticker, e)
 
 
-def enter_trade(trading, ticker: str, price: float) -> bool:
-    # One slot = $1,000; size by slot, not by risk dollars
-    qty = max(1, int(SLOT_SIZE / price))
-    stop_price = round(price * (1 - STOP_LOSS_PCT), 2)
-    tp_price   = round(price * (1 + TAKE_PROFIT_PCT), 2)
+def enter_trade(trading, ticker: str, signal: str, price: float,
+                cur_atr: float, stop: float, tp: float, slots: int) -> bool:
+    stop_dist = cur_atr * ATR_STOP_MULT
+    max_risk  = slots * MAX_RISK_PER_SLOT          # e.g. 20 slots × $20 = $400
+    qty       = max(1, int(max_risk / stop_dist))
+    side      = OrderSide.BUY if signal == "buy" else OrderSide.SELL
 
-    log.info("ENTRY BUY %s x%d @ ~$%.2f | cost=$%.0f | stop=$%.2f | tp=$%.2f",
-             ticker, qty, price, qty * price, stop_price, tp_price)
+    log.info(
+        "ENTRY %s %s x%d @ ~$%.2f | stop=$%.2f tp=$%.2f | atr=%.3f risk=$%.0f | slots=%d",
+        signal.upper(), ticker, qty, price, stop, tp,
+        cur_atr, qty * stop_dist, slots,
+    )
     try:
         trading.submit_order(MarketOrderRequest(
             symbol=ticker,
             qty=qty,
-            side=OrderSide.BUY,
+            side=side,
             time_in_force=TimeInForce.DAY,
             order_class=OrderClass.BRACKET,
-            take_profit=TakeProfitRequest(limit_price=tp_price),
-            stop_loss=StopLossRequest(stop_price=stop_price),
+            take_profit=TakeProfitRequest(limit_price=tp),
+            stop_loss=StopLossRequest(stop_price=stop),
         ))
         log.info("Bracket order submitted: %s", ticker)
         return True
@@ -229,16 +241,13 @@ def enter_trade(trading, ticker: str, price: float) -> bool:
         return False
 
 
-# ── Close all positions at 3:45 PM ───────────────────────────────────────────
-
 def close_all_positions(trading):
     log.info("3:45 PM — closing all open positions.")
     try:
-        positions = trading.get_all_positions()
-        for p in positions:
-            if not any(c.isdigit() for c in p.symbol):  # stocks only
+        for p in trading.get_all_positions():
+            if not any(c.isdigit() for c in p.symbol):  # skip options
                 close_position(trading, p.symbol, {
-                    "qty": float(p.qty),
+                    "qty":           float(p.qty),
                     "unrealized_pl": float(p.unrealized_pl),
                 })
     except Exception as e:
@@ -251,59 +260,37 @@ def run():
     state   = load_state()
     trading, data_client = get_clients()
 
-    # Always close all at 3:45 PM
+    # Force close all at 3:45 PM
     if is_close_all_time():
         close_all_positions(trading)
         save_state(state)
         return
 
-    # Track daily P&L from account
+    # Update total daily P&L
     try:
         acct = trading.get_account()
-        state["daily_pl"] = float(acct.equity) - float(acct.last_equity)
+        state["total_daily_pl"] = float(acct.equity) - float(acct.last_equity)
     except Exception:
         pass
 
-    # Count live open positions
-    try:
-        all_positions = trading.get_all_positions()
-        state["open_positions"] = len([p for p in all_positions if not any(c.isdigit() for c in p.symbol)])
-    except Exception:
-        pass
+    log.info("Daily P&L: $%.2f | ET: %s", state["total_daily_pl"], now_et().strftime("%H:%M"))
 
-    log.info("Daily P&L: $%.2f | Open positions: %d/%d",
-             state["daily_pl"], state["open_positions"], MAX_POSITIONS)
-
-    # Stop trading if daily loss limit hit
-    if state["daily_pl"] <= -MAX_DAILY_LOSS:
-        log.warning("Daily loss limit hit ($%.2f). No more trades today.", state["daily_pl"])
-        save_state(state)
-        return
-
-    # All slots full
-    if state["open_positions"] >= MAX_POSITIONS:
-        log.info("All %d slots occupied. No new entries this cycle.", MAX_POSITIONS)
-        save_state(state)
-        return
-
-    # Only trade in the 9:30–11:30 AM window
     if not in_trade_window():
-        log.info("Outside trade window (9:30–11:30 AM ET). Current ET: %s", now_et().strftime("%H:%M"))
+        log.info("Outside trade windows (9:45–11:30 AM | 1:30–3:00 PM ET).")
         save_state(state)
         return
 
-    # Fetch 5-min bars from market open to now
-    et_now   = now_et()
-    today_open = et_now.replace(hour=9, minute=25, second=0, microsecond=0)
-    start    = today_open.astimezone(timezone.utc)
-    end      = et_now.astimezone(timezone.utc)
+    # Fetch 5-min bars from market open to now for all tickers
+    et_now    = now_et()
+    day_start = et_now.replace(hour=9, minute=25, second=0, microsecond=0)
+    tickers   = [g["ticker"] for g in TICKER_GROUPS]
 
     try:
         req = StockBarsRequest(
-            symbol_or_symbols=SCAN_UNIVERSE,
-            timeframe=TimeFrame.Minute,
-            start=start,
-            end=end,
+            symbol_or_symbols=tickers,
+            timeframe=TimeFrame(5, TimeFrameUnit.Minute),
+            start=day_start.astimezone(timezone.utc),
+            end=et_now.astimezone(timezone.utc),
             feed=DataFeed.IEX,
         )
         all_bars = data_client.get_stock_bars(req).df
@@ -311,71 +298,76 @@ def run():
         log.error("Failed to fetch bars: %s", e)
         return
 
-    # ── Score every ticker in the universe ──────────────────────────────────
-    buy_signals   = []  # (ticker, price, sma_gap) — sorted by conviction
-    sell_signals  = []
+    # ── Process each ticker group ────────────────────────────────────────────
+    for group in TICKER_GROUPS:
+        ticker   = group["ticker"]
+        slots    = group["slots"]
+        gs       = state["groups"][ticker]
+        max_loss = slots * MAX_LOSS_PER_SLOT   # e.g. 20 slots × $50 = $1,000
 
-    for ticker in SCAN_UNIVERSE:
+        if gs["halted"]:
+            log.info("%s: halted for today (loss limit previously hit)", ticker)
+            continue
+
+        if gs["trades_today"] >= MAX_TRADES_PER_DAY:
+            log.info("%s: max %d trades reached today", ticker, MAX_TRADES_PER_DAY)
+            continue
+
+        # Check open position — halt group if loss limit breached
+        position = get_position(trading, ticker)
+        if position:
+            pl = position["unrealized_pl"]
+            if pl <= -max_loss:
+                log.warning(
+                    "%s: group loss limit hit (P&L=$%.2f / limit=$%.0f). Closing + halting.",
+                    ticker, pl, max_loss,
+                )
+                close_position(trading, ticker, position)
+                gs["halted"] = True
+            else:
+                log.info("%s: holding open position (P&L=$%.2f)", ticker, pl)
+            continue  # don't enter a new position while one is open
+
+        # Extract bars for this ticker
         try:
             if isinstance(all_bars.index, pd.MultiIndex):
                 df = all_bars.xs(ticker, level="symbol").copy()
             else:
                 df = all_bars[all_bars.get("symbol") == ticker].copy()
             df = df.sort_index()
-
-            if len(df) < 22:
-                continue
-
-            price  = df["close"].iloc[-1]
-            vwap   = calculate_vwap(df).iloc[-1]
-            signal = sma_crossover_signal(df["close"])
-            sma9   = df["close"].rolling(9).mean().iloc[-1]
-            sma21  = df["close"].rolling(21).mean().iloc[-1]
-
-            if signal == "buy" and price > vwap:
-                # Conviction = how far SMA9 is above SMA21 (bigger gap = stronger momentum)
-                gap = (sma9 - sma21) / sma21 * 100
-                buy_signals.append((ticker, price, gap))
-                log.info("BUY SIGNAL  %s @ $%.2f | SMA9=%.2f SMA21=%.2f VWAP=%.2f | gap=+%.3f%%",
-                         ticker, price, sma9, sma21, vwap, gap)
-
-            elif signal == "sell":
-                sell_signals.append(ticker)
-                log.info("SELL SIGNAL %s @ $%.2f | SMA crossed down", ticker, price)
-
         except Exception as e:
-            log.warning("Skipping %s: %s", ticker, e)
-
-    # ── Exit positions with sell signals ────────────────────────────────────
-    for ticker in sell_signals:
-        position = get_position(trading, ticker)
-        if position:
-            log.info("%s: SMA crossed down — closing position", ticker)
-            close_position(trading, ticker, position)
-
-    # ── Enter best buy signals (sorted by conviction) ────────────────────
-    buy_signals.sort(key=lambda x: x[2], reverse=True)  # strongest gap first
-
-    for ticker, price, gap in buy_signals:
-        if state["open_positions"] >= MAX_POSITIONS:
-            log.info("All %d slots occupied. Stopping entries.", MAX_POSITIONS)
-            break
-        position = get_position(trading, ticker)
-        if position:
-            continue  # already in this trade
-        if has_negative_news(ticker):
-            log.info("%s: skipping — negative news", ticker)
+            log.warning("No bars for %s: %s", ticker, e)
             continue
-        log.info("Best setup: %s (SMA gap=+%.3f%%) — entering [slot %d/%d]",
-                 ticker, gap, state["open_positions"] + 1, MAX_POSITIONS)
-        if enter_trade(trading, ticker, price):
-            state["open_positions"] += 1
 
-    if not buy_signals and not sell_signals:
-        log.info("No crossover signals found this cycle across %d tickers.", len(SCAN_UNIVERSE))
+        if len(df) < 25:
+            log.info("%s: only %d bars, need ≥25 — skipping", ticker, len(df))
+            continue
+
+        signal, price, cur_atr, stop, tp = get_signal(df)
+
+        if signal == "none":
+            log.info(
+                "%s: no signal | price=%.2f atr=%.3f rsi=%.1f",
+                ticker, price, cur_atr,
+                calc_rsi(df["close"]).iloc[-1] if len(df) >= RSI_PERIOD + 1 else 0,
+            )
+            continue
+
+        log.info(
+            "%s: %s signal | price=$%.2f atr=%.3f stop=$%.2f tp=$%.2f | "
+            "slots=%d max_risk=$%.0f",
+            ticker, signal.upper(), price, cur_atr, stop, tp,
+            slots, slots * MAX_RISK_PER_SLOT,
+        )
+
+        if enter_trade(trading, ticker, signal, price, cur_atr, stop, tp, slots):
+            gs["trades_today"] += 1
 
     save_state(state)
-    log.info("Cycle complete.")
+    log.info(
+        "Cycle complete. Trades: %s",
+        {k: v["trades_today"] for k, v in state["groups"].items()},
+    )
 
 
 if __name__ == "__main__":
