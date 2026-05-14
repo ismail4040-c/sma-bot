@@ -1,13 +1,14 @@
 """
 SMA Crossover Day Trading Bot
-Account: $1,000 | Goal: $10/day
-Strategy: Scans 50+ stocks every 5 min, finds best SMA(9)/SMA(21) crossover + VWAP
-News filter: MarketWatch RSS — skip trade if negative news on ticker
+Account: $100K treated as 100 × $1,000 slots
+Goal: $10/slot/day = $1,000/day total
+Strategy: Scans 50+ stocks every 5 min, finds SMA(9)/SMA(21) crossover + VWAP
+Each slot: $1,000 position | $20 risk | $50 daily loss limit
+Total limits: $2,000 risk per cycle | $5,000 max daily loss | 100 positions max
 Hours: 9:30–11:30 AM ET only | Close all by 3:45 PM ET
-Risk: $20 max per trade | $50 max daily loss | 3 trades max/day
 """
 
-import os, json, logging, xml.etree.ElementTree as ET
+import os, json, logging, xml.etree.ElementTree as ETree
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -56,11 +57,14 @@ MARKET_OPEN     = (9, 30)
 TRADE_WINDOW_END = (11, 30)
 CLOSE_ALL_TIME  = (15, 45)
 
-MAX_RISK_PER_TRADE = 20.0   # $20 max loss per trade
-MAX_DAILY_LOSS     = 50.0   # $50 stop trading for the day
-MAX_TRADES_PER_DAY = 3
-STOP_LOSS_PCT      = 0.005  # 0.5% stop loss
-TAKE_PROFIT_PCT    = 0.010  # 1.0% take profit
+# Per-slot rules (each slot = $1,000)
+SLOT_SIZE          = 1000.0  # dollars per position
+TOTAL_SLOTS        = 100     # 100 × $1,000 = $100K
+MAX_RISK_PER_TRADE = 20.0    # $20 stop loss per slot (2% of $1,000)
+MAX_DAILY_LOSS     = 5000.0  # $50 × 100 slots = $5,000 total daily loss limit
+MAX_POSITIONS      = 100     # up to 100 open at once (one per slot)
+STOP_LOSS_PCT      = 0.005   # 0.5% stop loss
+TAKE_PROFIT_PCT    = 0.010   # 1.0% take profit
 
 STATE_FILE = Path(__file__).parent / "state.json"
 
@@ -80,7 +84,7 @@ def load_state() -> dict:
         s = json.loads(STATE_FILE.read_text())
         if s.get("date") == today:
             return s
-    return {"date": today, "daily_pl": 0.0, "trades_today": 0}
+    return {"date": today, "daily_pl": 0.0, "open_positions": 0}
 
 
 def save_state(state: dict):
@@ -122,7 +126,7 @@ def has_negative_news(ticker: str) -> bool:
     try:
         url = f"https://feeds.marketwatch.com/marketwatch/topstories/"
         r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-        root = ET.fromstring(r.content)
+        root = ETree.fromstring(r.content)
         headlines = []
         for item in root.iter("item"):
             title = item.findtext("title") or ""
@@ -201,15 +205,13 @@ def close_position(trading, ticker: str, position: dict):
 
 
 def enter_trade(trading, ticker: str, price: float) -> bool:
-    # Size: risk $20 max, stop is 0.5% away
-    # qty = max_risk / (price * stop_pct)
-    qty = max(1, int(MAX_RISK_PER_TRADE / (price * STOP_LOSS_PCT)))
+    # One slot = $1,000; size by slot, not by risk dollars
+    qty = max(1, int(SLOT_SIZE / price))
     stop_price = round(price * (1 - STOP_LOSS_PCT), 2)
     tp_price   = round(price * (1 + TAKE_PROFIT_PCT), 2)
-    cost       = qty * price
 
-    log.info("ENTRY BUY %s x%d @ ~$%.2f | stop=$%.2f | tp=$%.2f | risk=$%.2f",
-             ticker, qty, price, stop_price, tp_price, qty * price * STOP_LOSS_PCT)
+    log.info("ENTRY BUY %s x%d @ ~$%.2f | cost=$%.0f | stop=$%.2f | tp=$%.2f",
+             ticker, qty, price, qty * price, stop_price, tp_price)
     try:
         trading.submit_order(MarketOrderRequest(
             symbol=ticker,
@@ -262,8 +264,15 @@ def run():
     except Exception:
         pass
 
-    log.info("Daily P&L: $%.2f | Trades today: %d/%d",
-             state["daily_pl"], state["trades_today"], MAX_TRADES_PER_DAY)
+    # Count live open positions
+    try:
+        all_positions = trading.get_all_positions()
+        state["open_positions"] = len([p for p in all_positions if not any(c.isdigit() for c in p.symbol)])
+    except Exception:
+        pass
+
+    log.info("Daily P&L: $%.2f | Open positions: %d/%d",
+             state["daily_pl"], state["open_positions"], MAX_POSITIONS)
 
     # Stop trading if daily loss limit hit
     if state["daily_pl"] <= -MAX_DAILY_LOSS:
@@ -271,9 +280,9 @@ def run():
         save_state(state)
         return
 
-    # Stop trading if max trades reached
-    if state["trades_today"] >= MAX_TRADES_PER_DAY:
-        log.info("Max trades (%d) reached for today.", MAX_TRADES_PER_DAY)
+    # All slots full
+    if state["open_positions"] >= MAX_POSITIONS:
+        log.info("All %d slots occupied. No new entries this cycle.", MAX_POSITIONS)
         save_state(state)
         return
 
@@ -348,8 +357,8 @@ def run():
     buy_signals.sort(key=lambda x: x[2], reverse=True)  # strongest gap first
 
     for ticker, price, gap in buy_signals:
-        if state["trades_today"] >= MAX_TRADES_PER_DAY:
-            log.info("Max %d trades reached for today.", MAX_TRADES_PER_DAY)
+        if state["open_positions"] >= MAX_POSITIONS:
+            log.info("All %d slots occupied. Stopping entries.", MAX_POSITIONS)
             break
         position = get_position(trading, ticker)
         if position:
@@ -357,9 +366,10 @@ def run():
         if has_negative_news(ticker):
             log.info("%s: skipping — negative news", ticker)
             continue
-        log.info("Best setup: %s (SMA gap=+%.3f%%) — entering", ticker, gap)
+        log.info("Best setup: %s (SMA gap=+%.3f%%) — entering [slot %d/%d]",
+                 ticker, gap, state["open_positions"] + 1, MAX_POSITIONS)
         if enter_trade(trading, ticker, price):
-            state["trades_today"] += 1
+            state["open_positions"] += 1
 
     if not buy_signals and not sell_signals:
         log.info("No crossover signals found this cycle across %d tickers.", len(SCAN_UNIVERSE))
