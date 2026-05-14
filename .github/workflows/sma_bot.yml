@@ -1,0 +1,41 @@
+name: SMA Crossover Bot ($1k Account)
+
+on:
+  schedule:
+    # Every 5 min during trade window 9:25-11:35 AM ET (13:25-15:35 UTC)
+    - cron: '25-59/5 13 * * 1-5'
+    - cron: '*/5 14,15 * * 1-5'
+    # Close all at 3:45 PM ET (19:45 UTC)
+    - cron: '45 19 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install alpaca-py pandas numpy requests
+
+      - name: Run SMA bot
+        env:
+          ALPACA_API_KEY_TECH:    ${{ secrets.ALPACA_API_KEY_TECH }}
+          ALPACA_SECRET_KEY_TECH: ${{ secrets.ALPACA_SECRET_KEY_TECH }}
+          ALPACA_PAPER:           "true"
+        run: python sma_bot.py
+
+      - name: Commit state
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json || true
+          git diff --cached --quiet || git commit -m "chore: update sma bot state [skip ci]"
+          git push
