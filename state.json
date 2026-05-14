@@ -1,0 +1,30 @@
+{
+  "date": "2026-05-14",
+  "total_daily_pl": 415.3099999999977,
+  "groups": {
+    "SPY": {
+      "halted": false,
+      "target_hit": false
+    },
+    "QQQ": {
+      "halted": false,
+      "target_hit": false
+    },
+    "AAPL": {
+      "halted": false,
+      "target_hit": false
+    },
+    "AMD": {
+      "halted": false,
+      "target_hit": false
+    },
+    "NVDA": {
+      "halted": false,
+      "target_hit": false
+    },
+    "MSFT": {
+      "halted": false,
+      "target_hit": false
+    }
+  }
+}
