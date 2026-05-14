@@ -39,8 +39,8 @@ TICKER_GROUPS = [
 
 SLOT_SIZE          = 1000.0   # $ per slot
 MAX_RISK_PER_SLOT  = 20.0     # 2% of $1,000 — risk per slot per trade
-MAX_LOSS_PER_SLOT  = 50.0     # halt group if unrealized loss > slots × $50
-MAX_TRADES_PER_DAY = 2        # max round-trips per group per day
+MAX_LOSS_PER_SLOT  = 50.0     # halt group if loss > slots × $50
+TARGET_PER_SLOT    = 10.0     # keep trading until group hits slots × $10 profit
 ATR_STOP_MULT      = 1.5      # stop_loss  = entry ± ATR × 1.5
 ATR_TP_MULT        = 2.5      # take_profit = entry ± ATR × 2.5
 EMA_FAST_PERIOD    = 9
@@ -69,7 +69,7 @@ def load_state() -> dict:
         "date": today,
         "total_daily_pl": 0.0,
         "groups": {
-            g["ticker"]: {"trades_today": 0, "halted": False}
+            g["ticker"]: {"halted": False, "target_hit": False}
             for g in TICKER_GROUPS
         },
     }
@@ -86,6 +86,31 @@ def get_clients():
     secret = os.environ["ALPACA_SECRET_KEY_TECH"]
     paper  = os.getenv("ALPACA_PAPER", "true").lower() == "true"
     return TradingClient(key, secret, paper=paper), StockHistoricalDataClient(key, secret)
+
+
+def get_realized_pl(ticker: str) -> float:
+    """Today's realized P&L for a ticker from filled buy/sell orders."""
+    key    = os.environ["ALPACA_API_KEY_TECH"]
+    secret = os.environ["ALPACA_SECRET_KEY_TECH"]
+    today  = datetime.now(NY_TZ).date().isoformat()
+    try:
+        r = requests.get(
+            f"https://paper-api.alpaca.markets/v2/orders"
+            f"?status=closed&symbols={ticker}&after={today}T00:00:00Z&limit=100",
+            headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret},
+            timeout=10,
+        )
+        orders = r.json() if r.status_code == 200 else []
+        if not isinstance(orders, list):
+            return 0.0
+        filled = [o for o in orders if o.get("status") == "filled"]
+        buy_val  = sum(float(o.get("filled_avg_price", 0)) * float(o.get("filled_qty", 0))
+                       for o in filled if o["side"] == "buy")
+        sell_val = sum(float(o.get("filled_avg_price", 0)) * float(o.get("filled_qty", 0))
+                       for o in filled if o["side"] == "sell")
+        return sell_val - buy_val
+    except Exception:
+        return 0.0
 
 
 # ── Time helpers ──────────────────────────────────────────────────────────────
@@ -303,32 +328,46 @@ def run():
         ticker   = group["ticker"]
         slots    = group["slots"]
         gs       = state["groups"][ticker]
+        target   = slots * TARGET_PER_SLOT     # e.g. 20 slots × $10 = $200
         max_loss = slots * MAX_LOSS_PER_SLOT   # e.g. 20 slots × $50 = $1,000
 
         if gs["halted"]:
-            log.info("%s: halted for today (loss limit previously hit)", ticker)
+            log.info("%s: halted for today (loss limit hit)", ticker)
             continue
 
-        if gs["trades_today"] >= MAX_TRADES_PER_DAY:
-            log.info("%s: max %d trades reached today", ticker, MAX_TRADES_PER_DAY)
+        # Check realized P&L to see if daily target is already met
+        realized_pl = get_realized_pl(ticker)
+        position    = get_position(trading, ticker)
+        unrealized  = float(position["unrealized_pl"]) if position else 0.0
+        group_pl    = realized_pl + unrealized
+
+        if gs["target_hit"] or group_pl >= target:
+            gs["target_hit"] = True
+            log.info(
+                "%s: ✅ TARGET HIT — P&L=$%.2f / target=$%.2f. Done for today.",
+                ticker, group_pl, target,
+            )
             continue
 
-        # Check open position — halt group if loss limit breached
-        position = get_position(trading, ticker)
+        log.info(
+            "%s: P&L=$%.2f / target=$%.2f | still working towards goal",
+            ticker, group_pl, target,
+        )
+
+        # Open position — monitor loss limit, otherwise hold
         if position:
-            pl = position["unrealized_pl"]
-            if pl <= -max_loss:
+            if unrealized <= -max_loss:
                 log.warning(
-                    "%s: group loss limit hit (P&L=$%.2f / limit=$%.0f). Closing + halting.",
-                    ticker, pl, max_loss,
+                    "%s: loss limit hit (unrealized=$%.2f / limit=$%.0f). Closing + halting.",
+                    ticker, unrealized, max_loss,
                 )
                 close_position(trading, ticker, position)
                 gs["halted"] = True
             else:
-                log.info("%s: holding open position (P&L=$%.2f)", ticker, pl)
-            continue  # don't enter a new position while one is open
+                log.info("%s: holding open position (unrealized=$%.2f)", ticker, unrealized)
+            continue
 
-        # Extract bars for this ticker
+        # No open position and target not met — look for next entry
         try:
             if isinstance(all_bars.index, pd.MultiIndex):
                 df = all_bars.xs(ticker, level="symbol").copy()
@@ -347,7 +386,7 @@ def run():
 
         if signal == "none":
             log.info(
-                "%s: no signal | price=%.2f atr=%.3f rsi=%.1f",
+                "%s: no signal yet | price=%.2f atr=%.3f rsi=%.1f",
                 ticker, price, cur_atr,
                 calc_rsi(df["close"]).iloc[-1] if len(df) >= RSI_PERIOD + 1 else 0,
             )
@@ -355,18 +394,18 @@ def run():
 
         log.info(
             "%s: %s signal | price=$%.2f atr=%.3f stop=$%.2f tp=$%.2f | "
-            "slots=%d max_risk=$%.0f",
+            "slots=%d target=$%.0f remaining=$%.2f",
             ticker, signal.upper(), price, cur_atr, stop, tp,
-            slots, slots * MAX_RISK_PER_SLOT,
+            slots, target, target - group_pl,
         )
 
-        if enter_trade(trading, ticker, signal, price, cur_atr, stop, tp, slots):
-            gs["trades_today"] += 1
+        enter_trade(trading, ticker, signal, price, cur_atr, stop, tp, slots)
 
     save_state(state)
     log.info(
-        "Cycle complete. Trades: %s",
-        {k: v["trades_today"] for k, v in state["groups"].items()},
+        "Cycle complete. Status: %s",
+        {k: ("TARGET ✅" if v["target_hit"] else "HALTED ❌" if v["halted"] else "working...")
+         for k, v in state["groups"].items()},
     )
 
 
