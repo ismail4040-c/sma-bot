@@ -283,12 +283,19 @@ def cleanup_foreign_positions(trading):
     try:
         for p in trading.get_all_positions():
             if p.symbol not in ema_tickers:
-                log.info("CLEANUP: closing non-EMA position %s (P&L=$%.2f)",
-                         p.symbol, float(p.unrealized_pl))
-                close_position(trading, p.symbol, {
-                    "qty":           float(p.qty),
-                    "unrealized_pl": float(p.unrealized_pl),
-                })
+                qty  = abs(int(float(p.qty)))
+                side = OrderSide.SELL if float(p.qty) > 0 else OrderSide.BUY
+                log.info("CLEANUP: closing %s x%d (P&L=$%.2f)",
+                         p.symbol, qty, float(p.unrealized_pl))
+                try:
+                    trading.submit_order(MarketOrderRequest(
+                        symbol=p.symbol,
+                        qty=qty,
+                        side=side,
+                        time_in_force=TimeInForce.DAY,
+                    ))
+                except Exception as e:
+                    log.warning("Could not close %s: %s", p.symbol, e)
     except Exception as e:
         log.error("Cleanup error: %s", e)
 
