@@ -26,16 +26,35 @@ log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-# 6 ticker groups — each slot = $1,000 of capital
-# Groups are non-overlapping with tech_trader.py
+# 20 ticker groups — each slot = $1,000 of capital (100 slots total)
+# All non-overlapping with tech_trader.py
 TICKER_GROUPS = [
-    {"ticker": "SPY",  "slots": 20},   # slots  1–20:  $20K
-    {"ticker": "QQQ",  "slots": 20},   # slots 21–40:  $20K
-    {"ticker": "AAPL", "slots": 15},   # slots 41–55:  $15K
-    {"ticker": "AMD",  "slots": 15},   # slots 56–70:  $15K
-    {"ticker": "NVDA", "slots": 15},   # slots 71–85:  $15K
-    {"ticker": "MSFT", "slots": 15},   # slots 86–100: $15K
-]
+    # ETFs — anchor groups, most liquid
+    {"ticker": "SPY",  "slots": 12},   # S&P 500
+    {"ticker": "QQQ",  "slots": 12},   # Nasdaq 100
+    {"ticker": "IWM",  "slots": 6},    # Russell 2000
+    {"ticker": "DIA",  "slots": 6},    # Dow Jones
+    {"ticker": "GLD",  "slots": 5},    # Gold
+    # Large cap tech (not in tech_trader)
+    {"ticker": "AAPL", "slots": 8},
+    {"ticker": "MSFT", "slots": 8},
+    {"ticker": "AMD",  "slots": 6},
+    {"ticker": "NVDA", "slots": 6},
+    # Finance
+    {"ticker": "V",    "slots": 5},    # Visa
+    {"ticker": "MA",   "slots": 5},    # Mastercard
+    {"ticker": "WFC",  "slots": 4},    # Wells Fargo
+    # Consumer
+    {"ticker": "WMT",  "slots": 4},    # Walmart
+    {"ticker": "COST", "slots": 4},    # Costco
+    {"ticker": "KO",   "slots": 3},    # Coca-Cola
+    {"ticker": "PEP",  "slots": 3},    # Pepsi
+    # Other
+    {"ticker": "DIS",  "slots": 4},    # Disney
+    {"ticker": "BA",   "slots": 3},    # Boeing
+    {"ticker": "LLY",  "slots": 3},    # Eli Lilly
+    {"ticker": "NKE",  "slots": 3},    # Nike
+]  # Total = 100 slots
 
 SLOT_SIZE          = 1000.0   # $ per slot
 MAX_RISK_PER_SLOT  = 20.0     # 2% of $1,000 — risk per slot per trade
