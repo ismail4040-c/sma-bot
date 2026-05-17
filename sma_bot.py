@@ -234,22 +234,57 @@ def get_position(trading, ticker: str) -> dict | None:
         return None
 
 
-def close_position(trading, ticker: str, position: dict):
+def cancel_all_orders(key: str, secret: str):
+    """Cancel every open order — clears bracket children before closing positions."""
     try:
-        qty  = abs(int(position["qty"]))
-        side = OrderSide.SELL if position["qty"] > 0 else OrderSide.BUY
-        trading.submit_order(MarketOrderRequest(
-            symbol=ticker, qty=qty, side=side, time_in_force=TimeInForce.DAY,
-        ))
-        log.info("CLOSED %s x%d | P&L: $%.2f", ticker, qty, position["unrealized_pl"])
+        r = requests.delete(
+            "https://paper-api.alpaca.markets/v2/orders",
+            headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret},
+            timeout=10,
+        )
+        log.info("Cancelled all open orders: %s", r.status_code)
     except Exception as e:
-        log.error("Failed to close %s: %s", ticker, e)
+        log.warning("Cancel orders error: %s", e)
+
+
+def force_close_all(key: str, secret: str):
+    """Cancel all orders then close every position — guaranteed clean slate."""
+    cancel_all_orders(key, secret)
+    try:
+        r = requests.delete(
+            "https://paper-api.alpaca.markets/v2/positions",
+            headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret},
+            timeout=10,
+        )
+        results = r.json() if isinstance(r.json(), list) else []
+        closed  = [x for x in results if x.get("status") == 200]
+        failed  = [x for x in results if x.get("status") != 200]
+        log.info("Closed %d positions. Failed: %d", len(closed), len(failed))
+        for f in failed:
+            log.warning("Failed to close %s: %s", f.get("symbol"), f.get("body", {}).get("message"))
+    except Exception as e:
+        log.error("Force close error: %s", e)
+
+
+def close_position_symbol(key: str, secret: str, symbol: str, qty: float):
+    """Close a single position by symbol."""
+    cancel_all_orders(key, secret)
+    side = "sell" if qty > 0 else "buy"
+    try:
+        r = requests.delete(
+            f"https://paper-api.alpaca.markets/v2/positions/{symbol}",
+            headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret},
+            timeout=10,
+        )
+        log.info("Closed %s: %s", symbol, r.status_code)
+    except Exception as e:
+        log.error("Failed to close %s: %s", symbol, e)
 
 
 def enter_trade(trading, ticker: str, signal: str, price: float,
                 cur_atr: float, stop: float, tp: float, slots: int) -> bool:
     stop_dist = cur_atr * ATR_STOP_MULT
-    max_risk  = slots * MAX_RISK_PER_SLOT          # e.g. 20 slots × $20 = $400
+    max_risk  = slots * MAX_RISK_PER_SLOT
     qty       = max(1, int(max_risk / stop_dist))
     side      = OrderSide.BUY if signal == "buy" else OrderSide.SELL
 
@@ -275,55 +310,32 @@ def enter_trade(trading, ticker: str, signal: str, price: float,
         return False
 
 
-def close_all_positions(trading):
-    log.info("3:45 PM — closing all open positions.")
-    try:
-        for p in trading.get_all_positions():
-            close_position(trading, p.symbol, {
-                "qty":           float(p.qty),
-                "unrealized_pl": float(p.unrealized_pl),
-            })
-    except Exception as e:
-        log.error("Error closing positions: %s", e)
-
-
-def cleanup_foreign_positions(trading):
-    """Close any positions that are not part of the EMA strategy."""
-    ema_tickers = {g["ticker"] for g in TICKER_GROUPS}
-    try:
-        for p in trading.get_all_positions():
-            if p.symbol not in ema_tickers:
-                qty  = abs(int(float(p.qty)))
-                side = OrderSide.SELL if float(p.qty) > 0 else OrderSide.BUY
-                log.info("CLEANUP: closing %s x%d (P&L=$%.2f)",
-                         p.symbol, qty, float(p.unrealized_pl))
-                try:
-                    trading.submit_order(MarketOrderRequest(
-                        symbol=p.symbol,
-                        qty=qty,
-                        side=side,
-                        time_in_force=TimeInForce.DAY,
-                    ))
-                except Exception as e:
-                    log.warning("Could not close %s: %s", p.symbol, e)
-    except Exception as e:
-        log.error("Cleanup error: %s", e)
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run():
     state   = load_state()
+    key     = os.environ["ALPACA_API_KEY_TECH"]
+    secret  = os.environ["ALPACA_SECRET_KEY_TECH"]
     trading, data_client = get_clients()
 
-    # Force close all at 3:45 PM
+    # 3:45 PM — cancel every order then close every position, no exceptions
     if is_close_all_time():
-        close_all_positions(trading)
+        log.info("3:45 PM — force closing ALL positions and orders.")
+        force_close_all(key, secret)
         save_state(state)
         return
 
-    # Always close any positions not in the EMA strategy (cleanup foreign trades)
-    cleanup_foreign_positions(trading)
+    # Every cycle — close any foreign positions (options, other bots) immediately
+    ema_tickers = {g["ticker"] for g in TICKER_GROUPS}
+    try:
+        all_pos = trading.get_all_positions()
+        foreign = [p for p in all_pos if p.symbol not in ema_tickers]
+        if foreign:
+            log.info("Found %d foreign position(s) — closing now.", len(foreign))
+            for p in foreign:
+                close_position_symbol(key, secret, p.symbol, float(p.qty))
+    except Exception as e:
+        log.warning("Foreign position cleanup error: %s", e)
 
     # Update total daily P&L
     try:
@@ -395,7 +407,7 @@ def run():
                     "%s: loss limit hit (unrealized=$%.2f / limit=$%.0f). Closing + halting.",
                     ticker, unrealized, max_loss,
                 )
-                close_position(trading, ticker, position)
+                close_position_symbol(key, secret, ticker, position["qty"])
                 gs["halted"] = True
             else:
                 log.info("%s: holding open position (unrealized=$%.2f)", ticker, unrealized)
