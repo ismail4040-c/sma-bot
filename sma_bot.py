@@ -186,40 +186,33 @@ def calc_vwap(df: pd.DataFrame) -> pd.Series:
 
 def get_signal(df: pd.DataFrame):
     """
+    Always enters a trade — direction set by EMA9 vs EMA21.
+    Only skips if RSI is completely exhausted (< 20 or > 80) or ATR is invalid.
     Returns (signal, price, cur_atr, stop_price, tp_price).
-    signal is 'buy', 'sell', or 'none'.
     """
-    min_bars = max(EMA_SLOW_PERIOD, ATR_PERIOD, RSI_PERIOD, VOLUME_LOOKBACK) + 3
+    min_bars = max(EMA_SLOW_PERIOD, ATR_PERIOD, RSI_PERIOD) + 3
     if len(df) < min_bars:
         return "none", 0.0, 0.0, 0.0, 0.0
 
-    e9   = calc_ema(df["close"], EMA_FAST_PERIOD)
-    e21  = calc_ema(df["close"], EMA_SLOW_PERIOD)
-    cur_rsi  = calc_rsi(df["close"]).iloc[-1]
-    cur_atr  = calc_atr(df).iloc[-1]
-    cur_vwap = calc_vwap(df).iloc[-1]
-    price    = df["close"].iloc[-1]
-    cur_vol  = df["volume"].iloc[-1]
-    avg_vol  = df["volume"].rolling(VOLUME_LOOKBACK).mean().iloc[-2]  # avoid look-ahead
+    e9      = calc_ema(df["close"], EMA_FAST_PERIOD)
+    e21     = calc_ema(df["close"], EMA_SLOW_PERIOD)
+    cur_rsi = calc_rsi(df["close"]).iloc[-1]
+    cur_atr = calc_atr(df).iloc[-1]
+    price   = df["close"].iloc[-1]
 
-    if pd.isna(cur_atr) or cur_atr <= 0:
+    if pd.isna(cur_atr) or cur_atr <= 0 or pd.isna(cur_rsi):
         return "none", price, 0.0, 0.0, 0.0
 
-    prev_above = e9.iloc[-2] > e21.iloc[-2]
-    curr_above = e9.iloc[-1] > e21.iloc[-1]
+    ema_bullish = e9.iloc[-1] > e21.iloc[-1]
 
-    # LONG: EMA crossed up + RSI 35–70 + volume (VWAP above = stronger but not required)
-    if (not prev_above and curr_above
-            and 35 <= cur_rsi <= 70
-            and cur_vol > avg_vol):
+    # BUY — EMA9 above EMA21 (uptrend), skip only if completely overbought
+    if ema_bullish and cur_rsi <= 80:
         stop = round(price - cur_atr * ATR_STOP_MULT, 2)
         tp   = round(price + cur_atr * ATR_TP_MULT,   2)
         return "buy", price, cur_atr, stop, tp
 
-    # SHORT: EMA crossed down + RSI 30–65 + volume (VWAP below = stronger but not required)
-    if (prev_above and not curr_above
-            and 30 <= cur_rsi <= 65
-            and cur_vol > avg_vol):
+    # SELL — EMA9 below EMA21 (downtrend), skip only if completely oversold
+    if not ema_bullish and cur_rsi >= 20:
         stop = round(price + cur_atr * ATR_STOP_MULT, 2)
         tp   = round(price - cur_atr * ATR_TP_MULT,   2)
         return "sell", price, cur_atr, stop, tp
