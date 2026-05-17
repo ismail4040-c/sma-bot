@@ -208,19 +208,17 @@ def get_signal(df: pd.DataFrame):
     prev_above = e9.iloc[-2] > e21.iloc[-2]
     curr_above = e9.iloc[-1] > e21.iloc[-1]
 
-    # LONG: EMA crossed up, price above VWAP, RSI 45–65, volume surge
+    # LONG: EMA crossed up + RSI 35–70 + volume (VWAP above = stronger but not required)
     if (not prev_above and curr_above
-            and price > cur_vwap
-            and 45 <= cur_rsi <= 65
+            and 35 <= cur_rsi <= 70
             and cur_vol > avg_vol):
         stop = round(price - cur_atr * ATR_STOP_MULT, 2)
         tp   = round(price + cur_atr * ATR_TP_MULT,   2)
         return "buy", price, cur_atr, stop, tp
 
-    # SHORT: EMA crossed down, price below VWAP, RSI 35–55, volume surge
+    # SHORT: EMA crossed down + RSI 30–65 + volume (VWAP below = stronger but not required)
     if (prev_above and not curr_above
-            and price < cur_vwap
-            and 35 <= cur_rsi <= 55
+            and 30 <= cur_rsi <= 65
             and cur_vol > avg_vol):
         stop = round(price + cur_atr * ATR_STOP_MULT, 2)
         tp   = round(price - cur_atr * ATR_TP_MULT,   2)
