@@ -1,6 +1,6 @@
 {
-  "date": "2026-05-15",
-  "total_daily_pl": 422.3299999999872,
+  "date": "2026-05-18",
+  "total_daily_pl": 0.0,
   "groups": {
     "SPY": {
       "halted": false,
@@ -10,7 +10,23 @@
       "halted": false,
       "target_hit": false
     },
+    "IWM": {
+      "halted": false,
+      "target_hit": false
+    },
+    "DIA": {
+      "halted": false,
+      "target_hit": false
+    },
+    "GLD": {
+      "halted": false,
+      "target_hit": false
+    },
     "AAPL": {
+      "halted": false,
+      "target_hit": false
+    },
+    "MSFT": {
       "halted": false,
       "target_hit": false
     },
@@ -22,7 +38,47 @@
       "halted": false,
       "target_hit": false
     },
-    "MSFT": {
+    "V": {
+      "halted": false,
+      "target_hit": false
+    },
+    "MA": {
+      "halted": false,
+      "target_hit": false
+    },
+    "WFC": {
+      "halted": false,
+      "target_hit": false
+    },
+    "WMT": {
+      "halted": false,
+      "target_hit": false
+    },
+    "COST": {
+      "halted": false,
+      "target_hit": false
+    },
+    "KO": {
+      "halted": false,
+      "target_hit": false
+    },
+    "PEP": {
+      "halted": false,
+      "target_hit": false
+    },
+    "DIS": {
+      "halted": false,
+      "target_hit": false
+    },
+    "BA": {
+      "halted": false,
+      "target_hit": false
+    },
+    "LLY": {
+      "halted": false,
+      "target_hit": false
+    },
+    "NKE": {
       "halted": false,
       "target_hit": false
     }
